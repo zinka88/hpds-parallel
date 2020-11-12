@@ -1,2 +1,4 @@
 # hpds-parallel
-HPDS Lab: Parallel Programming Examples
+Parallel Programming Example
+HPDS Lab
+November 17, 2020
