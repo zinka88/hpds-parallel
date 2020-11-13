@@ -1,0 +1,213 @@
+---
+title: "Parallel Programming"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This document runs through some examples for parallel programming in R. Many of its examples are based of the following two websites:
+
+-Roger Peng's Programming for Data Science [chapter on parallel computing]( https://bookdown.org/rdpeng/rprogdatascience/parallel-computation.html)
+
+-Hadley Wickham's book on [Advanced R](http://adv-r.had.co.nz/Profiling.html)
+
+
+It is likely that there are even better ways to implement my code, but this should help get you started! 
+
+## Loading packages
+
+Let's start by loading the packages we will need in this example in order to practice with profiling, benchmarking, and running parallel processes! Note, the benchmarking package I'm using (`lineprof`) is not available on Cran and must be downloaded directly from Hadley Wickham's github. 
+
+```{r pressure, echo=TRUE, message=FALSE, warning=FALSE}
+# lineprof not on cran must download directly
+#devtools::install_github("hadley/lineprof")
+
+library(lineprof)
+library(microbenchmark)
+library(doParallel)
+library(parallel) 
+library(foreach) 
+
+```
+
+## Example
+
+I've set up some sample code in the *sample_code.R* for an "analysis" I'm running. This dataset contains information on annual health care spending, demographics, and heatlh conditions for people with commercial insurance. For my analysis, I want to try to predict annual spending using all the available inputs.
+
+This analysis first predicts spending with OLS (function: `ols`) then tries to step it up a bit with 5-fold cross validated OLS (function: `xval_ols`), and finally it bootstraps the mean predicted spending and finds the 95% confidence interval of these bootstrapped values (function: `boot`). 
+
+```{r}
+
+setwd('.')
+source('sample_code.R')
+
+# run analysis
+run_analysis<-function() {
+  ols()
+  predlist<-xval_ols()
+  boot(predlist)
+}
+
+```
+
+## Profiling
+
+Let's imagine that this code takes a while. Before trying to speed it up, it's good to understand where it is running slowly. Profiling allows you to figure out where the bottlenecks might be occuring. In this example, I use the package `lineprof` to see how long it takes to run each of my functions. The output can be interpreted as follows:
+
+Interpreting output 
+- *time* : time to run (seconds)
+
+- *alloc* : memory allocation (megabytes)
+
+- *release* : memory released (megabytes)
+
+- *dups* : number of vector duplications that occured 
+
+I could also open up a fancier version of this with R Shiny. 
+
+```{r}
+l<-lineprof(run_analysis())
+l
+
+# open with shiny
+# shine(l)
+```
+
+## foreach & doParallel
+
+`foreach` and `doParallel` are packages to parallelize loops in R:`doParallel` provides parallel backend for each %dopar% function in the foreach statement. In this example, I might want to parallelize the cross-validation by doing each fold at the same time. Note, there are many packages now that take care of this for you.
+
+To start, you must first register the number of cores you will use. After your task is complete, you want to close your connection. 
+
+```{r}
+# you must register the cores you will use 
+cl<-makePSOCKcluster(4)
+registerDoParallel(cl)
+
+# DO STUFF IN PARALLEL
+
+# close cluster connection
+stopCluster(cl)
+```
+
+Now, you can update the for loop syntax to a foreach statement with %dopar% to indicate that you are doing each fold in parallel. 
+
+```{r}
+# update xval function in parallel using foreach and %dopar%
+xval_ols_updt<-function() {
+ 
+  cl<-makePSOCKcluster(4)
+  registerDoParallel(cl)
+  
+  nfolds<-5
+  data$folds<-cut(seq(1,nrow(data)),breaks=nfolds,labels=FALSE)
+  
+  # run OLS for each fold 
+  results<-foreach(i=1:nfolds, .combine=rbind) %dopar% {
+    # split into train/test
+    index<-which(data$folds==i)
+    test_i<-data[index,]
+    train_i<-data[-index,]
+    
+    # fit on train and predict on test
+    ra_i<-lm(totpay~., data=train_i)
+    fit_i<-predict(ra_i, data=test_i)
+    
+    # add predicted data for the fold to the final dataset
+    fit_i<-data.frame(pred=fit_i, fold=i)
+    
+    fit_i
+  }
+  
+  stopCluster(cl)
+  return(results)
+
+}
+
+```
+
+You can benchmark the updated parallel 5-fold cross-validation function with your original function using the `microbenchmark` package. 
+
+```{r}
+# benchmark update using package microbenchmark
+a<-xval_ols()
+b<-xval_ols_updt()
+speed_test_xval<-microbenchmark(a, b)
+speed_test_xval
+
+# plot results 
+ggplot2::autoplot(speed_test_xval)
+
+```
+
+## The parallel package
+
+The `parallel` package is the workhorse behind a lot of parallel tasks in R. If you have a Mac, you can use the functions mclapply and mcmapply which are parallel versions of lapply and mapply, respectively. 
+No mac? Try using parLapply and other similar functions listed here: 
+`r ?clusterApply`
+
+On Windows you need to set up your environment (e.g. register the cluster, load packages on new clusters, etc.). McLapply clones all the work processes when it's called so you don't need to set up a new session removing this step for the Mac user. 
+
+```{r}
+# bootstrap using mclapply 
+boot_updt<-function(predlist) {
+  mean.boot<-mclapply(1:500, function(i) {
+    xnew<-sample(predlist$pred, replace = TRUE)
+    (mean(xnew))
+  }, mc.cores = 4)
+  
+  
+  quantile(unlist(mean.boot), c(.025,.975), na.rm=TRUE)
+}
+
+# compare update with benchmark 
+output<-xval_ols_updt()
+
+a<-boot(output)
+b<-boot_updt(output)
+speed_test_boot<-microbenchmark(a, b)
+speed_test_boot
+```
+
+## Putting it all together 
+
+Now let's try to run our analysis with the new updates (cross-validation and bootstrapping in parallel) and compare it to the original program ... were we able to speed things up :nervous:???
+
+```{r}
+# let's try our whole program now with updated functions
+run_analysis_updt<-function() {
+  ols()
+  predlist<-xval_ols_updt()
+  boot_updt(predlist)
+}
+
+a<-run_analysis()
+b<-run_analysis_updt()
+speed_test_all<-microbenchmark(a, b)
+speed_test_all
+
+ggplot2::autoplot(speed_test_all) 
+```
+
+##  Pro Tips: Generating random #s in parallel   
+We want random #s in parallel processes to be DIFFERENT from each other, but also reproducible... How do we ensure every time we run our parallel process we get the same different numbers for each process? The parallel package can ensure this happens if you specify the random generator as shown below. Note, the `parallel` package usually takes care of this for you, but it is always smart to set this just in case. 
+ 
+```{r}
+
+# must set this random # generator! 
+RNGkind("L'Ecuyer-CMRG")
+set.seed(1248)
+
+gen_randonums<-function() {
+  nums<-mclapply(1:4, function(i) {
+  rnorm(3)
+}, mc.cores = 4)
+  return(nums)
+}
+
+gen_randonums()
+```
